@@ -342,10 +342,102 @@ diff $BACKUP_DIR/db_sizes_before.txt $BACKUP_DIR/db_sizes_after.txt
 
 - 应用配置不需要改（IP/端口未变），让应用尝试连接
 - 跑 1–2 个核心读写事务
-- 看 `pg_log` 日志：
+- 看 `pg_log` 日志（用变量避开 glob 把多文件传给 `tail -50` 报错的坑）：
   ```bash
-  tail -200 /home/opengauss/data/pg_log/postgresql-*.log
+  LATEST_LOG=$(ls -t /home/opengauss/data/pg_log/postgresql-*.log | head -1)
+  echo "看的是: $LATEST_LOG"
+  tail -n 200 "$LATEST_LOG"
+  grep -cE 'FATAL|PANIC' "$LATEST_LOG"
+  grep -cE 'ERROR'       "$LATEST_LOG"
+  grep -i 'too many'     "$LATEST_LOG" | tail -10
   ```
+
+### 8.5 systemd 加固（关键！手工 gs_ctl → systemd 切换必做）
+
+> **重要背景**：迁移前实例是手工 `gs_ctl start` 启动的，进程继承的是 opengauss 用户登录 shell 的高 ulimit（一般 1000000）。改成 systemd 起之后，进程继承的是 systemd 默认 ulimit（通常 1024 或 4096），开放业务连接没几秒就会出现：
+> ```
+> ERROR: could not open file "base/267748/268546_fsm": Too many open files
+> ```
+> 这不是数据问题，是文件描述符上限不够。必须用 drop-in 文件把限制显式传给 systemd。
+
+```bash
+# 8.5.1 创建 drop-in 配置（systemd 推荐做法，不直接改 /usr/lib/systemd/system/ 下的原文件）
+mkdir -p /etc/systemd/system/opengauss.service.d
+
+cat > /etc/systemd/system/opengauss.service.d/limits.conf <<'EOF'
+[Unit]
+# StartLimitBurst / StartLimitIntervalSec 必须放在 [Unit] 段
+# 放在 [Service] 段 systemd 会忽略（这是踩过的坑）
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+[Service]
+LimitNOFILE=1000000
+LimitNPROC=1000000
+LimitCORE=infinity
+LimitMEMLOCK=infinity
+LimitSTACK=infinity
+
+# 异常退出 5 秒后自动拉起；60 秒内最多重启 3 次
+Restart=on-failure
+RestartSec=5
+EOF
+
+systemctl daemon-reload
+```
+
+```bash
+# 8.5.2 让限制对当前运行的 gaussdb 生效，必须 restart
+# 注意：业务连接会断 1-3 秒，应用层有重连机制就没事
+systemctl restart opengauss
+sleep 5
+systemctl status opengauss --no-pager
+```
+
+```bash
+# 8.5.3 验证 ulimit 真的生效
+GAUSSPID=$(pgrep -f /usr/local/opengauss/bin/gaussdb | head -1)
+grep -E 'Max open files|Max processes' /proc/$GAUSSPID/limits
+# 期望：Soft/Hard Limit 都是 1000000
+
+# 验证 systemd 看到的配置
+systemctl show opengauss \
+    -p LimitNOFILE -p LimitNPROC \
+    -p Restart -p RestartUSec \
+    -p StartLimitBurst -p StartLimitIntervalUSec
+# 期望：
+#   LimitNOFILE=1000000
+#   LimitNPROC=1000000
+#   Restart=on-failure
+#   RestartUSec=5s
+#   StartLimitBurst=3
+#   StartLimitIntervalUSec=1min
+```
+
+```bash
+# 8.5.4 顺便把 opengauss 用户的 shell ulimit 也持久化（防止以后再手工启动又踩坑）
+cat > /etc/security/limits.d/91-opengauss.conf <<'EOF'
+opengauss soft nofile 1000000
+opengauss hard nofile 1000000
+opengauss soft nproc  1000000
+opengauss hard nproc  1000000
+opengauss soft core   unlimited
+opengauss hard core   unlimited
+opengauss soft stack  3072
+opengauss hard stack  3072
+EOF
+
+# 验证（要重新登录 opengauss 才生效，不影响 gaussdb 进程）
+su - opengauss -c 'ulimit -n; ulimit -u; ulimit -c'
+# 期望：1000000 / 1000000 / unlimited
+```
+
+```bash
+# 8.5.5 修复迁移前 disabled 的隐患，让 systemd 接管开机自启
+systemctl enable opengauss
+systemctl is-enabled opengauss
+# 期望：enabled
+```
 
 ---
 
@@ -356,7 +448,22 @@ df -h /
 df -h /home
 ```
 
-`/` 应该掉到 30%+ 以下，`/home` 多出 58G 占用。让业务恢复正常流量。
+> **预期与误区**：此时 `/` **仍然显示 ~94%**，不是迁移失败，是因为旧数据目录 `/var/lib/opengauss/data.bak_xxx` 还在原地（作为观察期回滚锚点）。`/home` 应该多出 ~58G 占用。
+>
+> `/` 占用真正"掉下来"要等第 11 节观察期结束后 `rm -rf data.bak_*` 才会发生。
+>
+> 如果观察期 `/` 的 4G 可用空间让你不安，可以提前把旧目录压缩归档（仍保留回滚能力，占用从 58G 降到 ~15G）：
+> ```bash
+> # 可选，不做也行
+> tar --acls --xattrs -I 'zstd -T0 -19' -cf /home/gauss_backup/data.bak_$(date +%F).tar.zst \
+>     -C /var/lib/opengauss data.bak_xxx
+> # 验证 tar 完整
+> tar -I zstd -tf /home/gauss_backup/data.bak_*.tar.zst | wc -l
+> # 删原目录
+> rm -rf /var/lib/opengauss/data.bak_xxx
+> ```
+
+让业务恢复正常流量。
 
 ---
 
@@ -453,6 +560,14 @@ su - opengauss -c 'cat $PGDATA/gaussdb.state'
    xfs_growfs /home          # 或 resize2fs，看文件系统类型
    ```
 
+### ulimit 坑（手工 gs_ctl → systemd 切换最常踩）
+
+切换启动方式后，**前几秒业务连接可能瞬间报 "Too many open files"**。表象像数据库坏了，实际是 systemd 不继承 `.bash_profile` 里设置的 ulimit。openGauss 单实例至少要 `LimitNOFILE=1000000`，必须通过 drop-in 文件 `/etc/systemd/system/opengauss.service.d/limits.conf` 显式设置，且**配完要 `systemctl restart opengauss` 才能对当前进程生效**（daemon-reload 只更新策略，不影响运行的进程）。具体见第 8.5 节。
+
+### systemd drop-in 段位坑
+
+`StartLimitBurst` 和 `StartLimitIntervalSec` 必须放在 **`[Unit]`** 段，放到 `[Service]` 段 systemd 会**静默忽略**（`systemctl show` 看到的还是默认值 10s）。`LimitNOFILE` 这种 Resource Limit 类则要放 `[Service]`。一个 drop-in 文件可以同时有 `[Unit]` 和 `[Service]` 两段。
+
 ### 启停坑：systemd 服务文件存在但没接管进程
 
 如果迁移前实例是手工 `gs_ctl start` 启的，systemd 单元会显示 `inactive (dead)`、进程却在跑很久。这种状态下：
@@ -488,4 +603,6 @@ su - opengauss -c 'cat $PGDATA/gaussdb.state'
 5. 旧目录改名留底：`mv /var/lib/opengauss/data /var/lib/opengauss/data.bak_xxx`
 6. 改 PGDATA：`/var/lib/opengauss/.bash_profile`（PGDATA 行）+ `/usr/lib/systemd/system/opengauss.service`（3 处 `-D` 路径）
 7. 重载 + 启库：`systemctl daemon-reload && systemctl start opengauss`
-8. 验证 → 业务恢复 → 观察 72 小时 → 删旧目录 → `systemctl enable opengauss`
+8. **加 systemd drop-in 设 LimitNOFILE=1000000 + Restart=on-failure，然后 `systemctl restart opengauss` 让 ulimit 对运行进程生效**
+9. `systemctl enable opengauss`（修复迁移前 disabled 隐患）
+10. 验证 → 业务恢复 → 观察 24-72 小时 → `rm -rf /var/lib/opengauss/data.bak_xxx`（此时 `/` 占用才会真正掉下来）
