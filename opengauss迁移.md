@@ -163,12 +163,16 @@ su - opengauss -c "gsql -d postgres -p 7654 -c 'CHECKPOINT;'"
 
 ### 5.2 优雅停库（fast 模式）
 
-```bash
-# 推荐用 systemd
-systemctl stop opengauss
+> **环境差异提醒**：本台机器实际是手工 `gs_ctl start` 启动的（systemd 服务一直是 disabled），systemd **没有真正接管进程**。因此本次停库**不能用 `systemctl stop`（停不下来），必须用 `gs_ctl stop`**。第 7.2 节修复 systemd 服务文件之后，下次起停才会被 systemd 正常接管。
 
-# 或者：
-# su - opengauss -c "gs_ctl stop -D \$PGDATA -m fast"
+```bash
+# 本次（systemd 未接管）：必须用 gs_ctl
+su - opengauss -c "gs_ctl stop -D \$PGDATA -m fast"
+
+# 验证 systemd 是否接管的方法：
+# systemctl status opengauss
+# 如果 Active: inactive (dead) 但 ps 里看到 gaussdb 还在跑 → systemd 没接管，必须用 gs_ctl
+# 如果 Active: active (running) → 才能用 systemctl stop
 ```
 
 ### 5.3 确认完全停了
@@ -253,13 +257,21 @@ su - opengauss -c 'echo $PGDATA'
 
 ### 7.2 改 systemd 服务文件
 
+> 服务文件里通常有 3 处 `gs_ctl ... -D /var/lib/opengauss/data` 需要改（ExecStart / ExecStop / ExecReload）。`WorkingDirectory=/var/lib/opengauss` **不要动**——这是 opengauss 用户的 HOME，本次不迁。
+> 改完这一步意义很大：以后 `systemctl start/stop/reload opengauss` 都能正常工作，systemd 才能"正式接管"实例。
+
 ```bash
+# 先看现状
 grep -nE 'PGDATA|/var/lib/opengauss' /usr/lib/systemd/system/opengauss.service
 
+# 备份
 cp /usr/lib/systemd/system/opengauss.service $BACKUP_DIR/opengauss.service.before_edit
+
+# sed 只替换 /var/lib/opengauss/data，不会动 WorkingDirectory 那行
 sed -i 's|/var/lib/opengauss/data|/home/opengauss/data|g' \
     /usr/lib/systemd/system/opengauss.service
 
+# 看 diff（必须恰好 3 处改动）
 diff $BACKUP_DIR/opengauss.service.before_edit /usr/lib/systemd/system/opengauss.service
 
 systemctl daemon-reload
@@ -278,10 +290,28 @@ grep -rn '/var/lib/opengauss/data' /etc/ /usr/lib/systemd/ 2>/dev/null
 
 ### 8.1 启动
 
+> 第 7.2 节修好 systemd 服务文件之后，**本次启动用 `systemctl start` 是正确的选择**，借机让 systemd 正式接管。
+> 如果担心 systemd 还有问题，也可以先用 `gs_ctl start` 验证数据本身没问题，再单独排查 systemd。
+
+**首选（让 systemd 正式接管）：**
+
 ```bash
 systemctl start opengauss
 sleep 5
 systemctl status opengauss --no-pager
+```
+
+启动失败的话：
+
+```bash
+journalctl -u opengauss --no-pager -n 100
+tail -200 /home/opengauss/data/pg_log/postgresql-*.log
+```
+
+**备用（如果 systemd 启不起来，先用 gs_ctl 把库起来恢复业务，systemd 后续再修）：**
+
+```bash
+su - opengauss -c 'gs_ctl start -D $PGDATA'
 ```
 
 ### 8.2 进程与状态
@@ -367,9 +397,12 @@ rm -rf /var/lib/opengauss/data.bak_*
 # 11.4 备份归档到外部存储（NAS / 对象存储）
 ls -lh /home/gauss_backup/
 
-# 11.5 顺手把 systemd 服务设为开机自启
+# 11.5 强烈建议：把 systemd 服务设为开机自启
+# 迁移前本机 systemd 服务是 disabled 状态，数据库靠人工 gs_ctl 起，重启不会自动恢复。
+# 借这次迁移修复掉这个隐患：
 systemctl enable opengauss
 systemctl is-enabled opengauss
+# 期望输出：enabled
 ```
 
 ---
@@ -420,6 +453,21 @@ su - opengauss -c 'cat $PGDATA/gaussdb.state'
    xfs_growfs /home          # 或 resize2fs，看文件系统类型
    ```
 
+### 启停坑：systemd 服务文件存在但没接管进程
+
+如果迁移前实例是手工 `gs_ctl start` 启的，systemd 单元会显示 `inactive (dead)`、进程却在跑很久。这种状态下：
+
+- `systemctl stop` **完全不会动**那个 gaussdb 进程，必须用 `gs_ctl stop -D $PGDATA -m fast`
+- `systemctl status` 看到的"Active 时间"是误导信息，要以 `ps -ef | grep gaussdb` 为准
+- 第 7.2 节修好 service 文件 + `daemon-reload` 之后，systemd 才能正常起停
+
+### rsync 坑
+
+- **必须 root 跑 rsync**。opengauss 用户跑会读不到 root 创建的临时文件（比如调试 trust 时 `sed -i.bak` 留下的 `pg_hba.conf.bak_*`），报 Permission denied。
+- 第一次 rsync 跑得早、数据库还在跑 → pg_log、pg_xlog、postmaster.pid 边复制边变，文件会"小不一样"。**正确做法是停库后再 rsync 一次（加 `--delete`）**。
+- `du -sb` 在不同文件系统上对目录 inode 的字节数可能不同，**少量的 KB 差异是文件系统记账差异，不是数据差异**。判断数据一致性看：文件数 + `pg_control` 的 md5 + `PG_VERSION` 的 md5 + `rsync --delete` 是否再传文件（0 传输 = 一致）。
+- data 目录下出现 `pg_hba.conf.bak_*` 这种 .bak 文件，那是 sed 调试遗留，**直接 `rm` 掉**，不要迁过去。
+
 ### 备份时遇到过的坑（避坑清单）
 
 - `gs_dumpall -W` 不带值会把后面的 `-f` 当密码 → 报 "too many command-line arguments"。**不要随便加 `-W`**。
@@ -433,10 +481,11 @@ su - opengauss -c 'cat $PGDATA/gaussdb.state'
 
 ## 14. 一句话总结
 
-1. 备份：`gs_dumpall -U opengauss -p 7654 -f /home/gauss_backup/.../MPPDB_backup.sql`（opengauss 用户 shell 里跑）
-2. 停库：`systemctl stop opengauss`
-3. 迁数据：`rsync -aHX /var/lib/opengauss/data/ /home/opengauss/data/`
-4. 旧目录改名留底：`mv .../data .../data.bak_xxx`
-5. 改 PGDATA：`.bash_profile` 和 `opengauss.service` 里两处
-6. 启库：`systemctl daemon-reload && systemctl start opengauss`
-7. 验证 → 业务恢复 → 观察 72 小时 → 删旧目录
+1. 备份：`su - opengauss` → `gs_dumpall -U opengauss -p 7654 -f /home/gauss_backup/.../MPPDB_backup.sql`（不加 `-h`）
+2. 停库：先看 `systemctl status`；如 systemd 没接管，用 `su - opengauss -c "gs_ctl stop -D \$PGDATA -m fast"`
+3. 迁数据（root）：`rsync -aHX --numeric-ids --delete /var/lib/opengauss/data/ /home/opengauss/data/`
+4. 校验：文件数一致 + `pg_control` md5 一致 + `PG_VERSION` md5 一致
+5. 旧目录改名留底：`mv /var/lib/opengauss/data /var/lib/opengauss/data.bak_xxx`
+6. 改 PGDATA：`/var/lib/opengauss/.bash_profile`（PGDATA 行）+ `/usr/lib/systemd/system/opengauss.service`（3 处 `-D` 路径）
+7. 重载 + 启库：`systemctl daemon-reload && systemctl start opengauss`
+8. 验证 → 业务恢复 → 观察 72 小时 → 删旧目录 → `systemctl enable opengauss`
